@@ -1,0 +1,850 @@
+// =============================================================================
+// PRD v2 — Probabilistic Regime-Based Direction Forecast
+//           with Adaptive Online Calibration Layer
+// Version: 2.1 | Pine Script v6
+// Author:  Rennan Vieira
+//
+// ARCHITECTURE:
+//   Layer 1 — Feature Extraction
+//   Layer 2 — Softmax Regime Engine
+//   Layer 3 — Markov Transition Engine
+//   Layer 4 — Emission Matrix & Base Forecast
+//   Layer 5 — Adaptive Calibration
+//   Layer 6 — Probability Stabilization
+//
+// CAUSALITY: 100% causal. No repainting. No lookahead. No future leakage.
+// =============================================================================
+
+//@version=6
+indicator(
+     title         = "PRD v2 — Adaptive Regime Direction Forecast",
+     shorttitle    = "PRD v2",
+     overlay       = false,
+     max_bars_back = 500
+     )
+
+// =============================================================================
+// SECTION 0 — USER INPUTS
+// =============================================================================
+
+// ── Core ──────────────────────────────────────────────────────────────────────
+i_window = input.int(
+     300, "Rolling Window (bars)",
+     minval = 100, maxval = 500, step = 25,
+     tooltip = "History length for transition/emission learning.",
+     group = "Core Parameters")
+
+i_halflife = input.int(
+     40, "Decay Half-Life (bars)",
+     minval = 10, maxval = 120, step = 5,
+     tooltip = "Exponential decay half-life. Lower = faster adaptation.",
+     group = "Core Parameters")
+
+i_smooth = input.int(
+     5, "Probability Smoothing (bars)",
+     minval = 1, maxval = 20,
+     tooltip = "EMA length on final probabilities.",
+     group = "Core Parameters")
+
+// ── Regime ────────────────────────────────────────────────────────────────────
+i_vol_high = input.float(
+     0.015, "High Volatility Threshold",
+     minval = 0.005, maxval = 0.05, step = 0.001,
+     tooltip = "ATR/Price above this = High Vol regime.",
+     group = "Regime Parameters")
+
+i_vol_low = input.float(
+     0.007, "Low Volatility Threshold",
+     minval = 0.001, maxval = 0.03, step = 0.001,
+     tooltip = "ATR/Price below this = Low Vol regime.",
+     group = "Regime Parameters")
+
+i_softmax_temp = input.float(
+     1.5, "Softmax Temperature",
+     minval = 0.5, maxval = 5.0, step = 0.1,
+     tooltip = "Higher = flatter regime distribution. Prevents saturation.",
+     group = "Regime Parameters")
+
+// ── Feature Weights ───────────────────────────────────────────────────────────
+i_w_momentum = input.float(
+     0.30, "Momentum Weight",
+     minval = 0.0, maxval = 1.0, step = 0.05,
+     group = "Feature Weights")
+
+i_w_trend = input.float(
+     0.25, "Trend Weight",
+     minval = 0.0, maxval = 1.0, step = 0.05,
+     group = "Feature Weights")
+
+i_w_volatility = input.float(
+     0.20, "Volatility Weight",
+     minval = 0.0, maxval = 1.0, step = 0.05,
+     group = "Feature Weights")
+
+i_w_candle = input.float(
+     0.15, "Candle Structure Weight",
+     minval = 0.0, maxval = 1.0, step = 0.05,
+     group = "Feature Weights")
+
+i_w_volume = input.float(
+     0.10, "Volume Weight",
+     minval = 0.0, maxval = 1.0, step = 0.05,
+     group = "Feature Weights")
+
+// ── Calibration ───────────────────────────────────────────────────────────────
+i_cal_window = input.int(
+     100, "Calibration Window (bars)",
+     minval = 30, maxval = 300, step = 10,
+     tooltip = "Rolling window for prediction accuracy tracking.",
+     group = "Calibration")
+
+i_cal_halflife = input.int(
+     25, "Calibration Decay Half-Life",
+     minval = 5, maxval = 100, step = 5,
+     tooltip = "Exponential decay for calibration weights.",
+     group = "Calibration")
+
+i_cal_strength = input.float(
+     0.35, "Calibration Strength",
+     minval = 0.0, maxval = 1.0, step = 0.05,
+     tooltip = "How strongly calibration adjusts final probabilities.",
+     group = "Calibration")
+
+// ── Stabilization ─────────────────────────────────────────────────────────────
+i_entropy_reg = input.float(
+     0.05, "Entropy Regularization",
+     minval = 0.0, maxval = 0.20, step = 0.01,
+     tooltip = "Pulls probabilities toward uniform. Prevents saturation.",
+     group = "Stabilization")
+
+i_mean_rev = input.float(
+     0.08, "Mean Reversion Pressure",
+     minval = 0.0, maxval = 0.30, step = 0.01,
+     tooltip = "Gentle pull away from extreme probabilities.",
+     group = "Stabilization")
+
+i_prob_min = input.float(
+     0.05, "Minimum Probability Floor",
+     minval = 0.01, maxval = 0.15, step = 0.01,
+     tooltip = "No probability falls below this before renormalization.",
+     group = "Stabilization")
+
+i_prob_max = input.float(
+     0.88, "Maximum Probability Ceiling",
+     minval = 0.50, maxval = 0.95, step = 0.01,
+     tooltip = "No probability rises above this before renormalization.",
+     group = "Stabilization")
+
+// ── Multi-Timeframe ────────────────────────────────────────────────────────────
+i_use_weekly = input.bool(
+     true, "Use Weekly Context",
+     group = "Multi-Timeframe")
+
+i_weekly_weight = input.float(
+     0.20, "Weekly Influence",
+     minval = 0.0, maxval = 0.50, step = 0.05,
+     group = "Multi-Timeframe")
+
+// ── Display ───────────────────────────────────────────────────────────────────
+i_show_plot = input.bool(
+     true, "Show Score Plot",
+     group = "Visualization")
+
+i_show_table = input.bool(
+     true, "Show Probability Table",
+     group = "Visualization")
+
+// =============================================================================
+// SECTION 1 — CONSTANTS
+// =============================================================================
+
+// Regime indices — using simple int constants, NOT typed to avoid redeclaration
+var int BULL_LOW  = 0
+var int BULL_HIGH = 1
+var int BEAR_HIGH = 2
+var int SIDE_LOW  = 3
+
+// Outcome indices
+var int OUT_BULL    = 0
+var int OUT_BEAR    = 1
+var int OUT_NEUTRAL = 2
+
+// Thresholds
+float BULL_THRESH = 0.005
+float BEAR_THRESH = 0.005   // applied as negative in comparisons below
+
+// Uniform anchor
+float UNIFORM_3 = 1.0 / 3.0
+
+// Decay factors
+float lambda_main = math.log(2.0) / i_halflife
+float lambda_cal  = math.log(2.0) / i_cal_halflife
+
+// =============================================================================
+// SECTION 2 — UTILITY FUNCTIONS
+// =============================================================================
+
+// Clamp v between lo and hi
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+// Softmax over 4 values with temperature tau
+// Returns tuple of 4 normalized probabilities
+f_softmax4(float s0, float s1, float s2, float s3, float tau) =>
+    float t  = math.max(tau, 0.01)
+    float e0 = math.exp(s0 / t)
+    float e1 = math.exp(s1 / t)
+    float e2 = math.exp(s2 / t)
+    float e3 = math.exp(s3 / t)
+    float z  = e0 + e1 + e2 + e3
+    z        := z == 0.0 ? 1.0 : z
+    [e0 / z, e1 / z, e2 / z, e3 / z]
+
+// Normalize 3 values to sum = 1.0
+f_norm3(float a, float b, float c) =>
+    float total = a + b + c
+    float safe  = total <= 0.0 ? 1.0 : total
+    [a / safe, b / safe, c / safe]
+
+// =============================================================================
+// SECTION 3 — LAYER 1: FEATURE EXTRACTION
+// =============================================================================
+// 100% causal: only uses current and past bar data
+
+// ── Momentum ──────────────────────────────────────────────────────────────────
+float m1 = close / close[1] - 1.0
+float m3 = close / close[3] - 1.0
+float m5 = close / close[5] - 1.0
+
+float momentum_raw   = m1 * 0.50 + m3 * 0.30 + m5 * 0.20
+float momentum_score = f_clamp(momentum_raw / 0.03, -1.0, 1.0)
+
+// ── Trend ─────────────────────────────────────────────────────────────────────
+float ema20      = ta.ema(close, 20)
+float trend_dist = f_clamp((close - ema20) / ema20 / 0.03, -1.0, 1.0)
+float ema_slope  = f_clamp((ema20 - ema20[1]) / ema20[1] / 0.005, -1.0, 1.0)
+float trend_score = trend_dist * 0.60 + ema_slope * 0.40
+
+// ── Volatility ────────────────────────────────────────────────────────────────
+float atr14     = ta.atr(14)
+float atr_norm  = atr14 / close
+float vol_range = i_vol_high - i_vol_low
+float vol_score = f_clamp(
+     vol_range > 0.0 ? (atr_norm - i_vol_low) / vol_range : 0.5,
+     0.0, 1.0)
+
+// ── Candle Structure ──────────────────────────────────────────────────────────
+float candle_range = high - low
+float body_size    = math.abs(close - open)
+float body_ratio   = candle_range > 0.0 ? body_size / candle_range : 0.5
+float clv_val      = candle_range > 0.0
+     ? ((close - low) - (high - close)) / candle_range
+     : 0.0
+bool  bull_body    = close >= open
+float candle_score = f_clamp(
+     clv_val * (bull_body ? 1.0 : -1.0) * body_ratio,
+     -1.0, 1.0)
+
+// ── Volume ────────────────────────────────────────────────────────────────────
+float vol_sma20    = ta.sma(volume, 20)
+float rel_vol      = vol_sma20 > 0.0 ? volume / vol_sma20 : 1.0
+float volume_score = f_clamp((rel_vol - 1.0), -1.0, 1.0)
+
+// ── Current bar intraday return & outcome label ───────────────────────────────
+// Used to evaluate the PREVIOUS bar's prediction — fully causal
+float intraday_ret = open > 0.0 ? (close - open) / open : 0.0
+
+int cur_outcome = OUT_NEUTRAL
+if intraday_ret > BULL_THRESH
+    cur_outcome := OUT_BULL
+else if intraday_ret < -BULL_THRESH
+    cur_outcome := OUT_BEAR
+
+// =============================================================================
+// SECTION 4 — WEEKLY MULTI-TIMEFRAME CONTEXT
+// =============================================================================
+// lookahead_off is MANDATORY — prevents future weekly data leaking into daily
+
+float w_close  = request.security(syminfo.tickerid, "W", close,
+     lookahead = barmerge.lookahead_off)
+float w_close1 = request.security(syminfo.tickerid, "W", close[1],
+     lookahead = barmerge.lookahead_off)
+float w_close4 = request.security(syminfo.tickerid, "W", close[4],
+     lookahead = barmerge.lookahead_off)
+float w_atr    = request.security(syminfo.tickerid, "W", ta.atr(10),
+     lookahead = barmerge.lookahead_off)
+
+float w_m1        = w_close1 > 0.0 ? w_close / w_close1 - 1.0 : 0.0
+float w_m4        = w_close4 > 0.0 ? w_close / w_close4 - 1.0 : 0.0
+float w_momentum  = f_clamp((w_m1 * 0.50 + w_m4 * 0.50) / 0.04, -1.0, 1.0)
+
+float w_vol_denom  = i_vol_high * 2.0 - i_vol_low * 2.0
+float w_vol_norm   = w_close > 0.0 ? w_atr / w_close : 0.0
+float w_vol_score  = f_clamp(
+     w_vol_denom > 0.0 ? (w_vol_norm - i_vol_low * 2.0) / w_vol_denom : 0.5,
+     0.0, 1.0)
+
+float weekly_bull_mod = i_use_weekly ? w_momentum  : 0.0
+float weekly_vol_mod  = i_use_weekly ? w_vol_score : 0.5
+
+// =============================================================================
+// SECTION 5 — LAYER 2: SOFTMAX REGIME ENGINE
+// =============================================================================
+
+// ── Normalize feature weights ─────────────────────────────────────────────────
+float fw_sum  = i_w_momentum + i_w_trend + i_w_volatility + i_w_candle + i_w_volume
+float fw_safe = fw_sum == 0.0 ? 1.0 : fw_sum
+float wM      = i_w_momentum / fw_safe
+float wT      = i_w_trend    / fw_safe
+float wC      = i_w_candle   / fw_safe
+float wVl     = i_w_volume   / fw_safe
+
+// ── Composite directional score [-1, +1] ──────────────────────────────────────
+float vol_dir   = volume_score * (momentum_score >= 0.0 ? 1.0 : -1.0)
+float dir_denom = wM + wT + wC + wVl
+float dir_score = dir_denom > 0.0
+     ? (momentum_score * wM + trend_score * wT + candle_score * wC + vol_dir * wVl) / dir_denom
+     : 0.0
+
+if i_use_weekly
+    dir_score := dir_score * (1.0 - i_weekly_weight) + weekly_bull_mod * i_weekly_weight
+
+dir_score := f_clamp(dir_score, -1.0, 1.0)
+
+// ── Raw regime scores ─────────────────────────────────────────────────────────
+float rs_bull_low  = dir_score * 2.0 + (1.0 - vol_score) * 1.0
+float rs_bull_high = dir_score * 2.0 + vol_score * 1.0
+float rs_bear_high = -dir_score * 2.0 + vol_score * 1.0
+float neutral_pres = 1.0 - math.abs(dir_score)
+float rs_side_low  = neutral_pres * 1.5 + (1.0 - vol_score) * 0.5
+
+if i_use_weekly
+    float wvb      = i_weekly_weight * 0.5
+    rs_bull_high  := rs_bull_high + weekly_vol_mod         * wvb
+    rs_bear_high  := rs_bear_high + weekly_vol_mod         * wvb
+    rs_bull_low   := rs_bull_low  + (1.0 - weekly_vol_mod) * wvb
+    rs_side_low   := rs_side_low  + (1.0 - weekly_vol_mod) * wvb
+
+// ── Softmax → regime probabilities ───────────────────────────────────────────
+[rp_bull_low, rp_bull_high, rp_bear_high, rp_side_low] =
+     f_softmax4(rs_bull_low, rs_bull_high, rs_bear_high, rs_side_low, i_softmax_temp)
+
+// ── Hard regime label (for history buffers only) ──────────────────────────────
+// FIX: declare with default, then assign via if/else to avoid
+//      "end of line without line continuation" error
+int current_regime = SIDE_LOW
+
+if rp_bull_low >= rp_bull_high and rp_bull_low >= rp_bear_high and rp_bull_low >= rp_side_low
+    current_regime := BULL_LOW
+else if rp_bull_high >= rp_bear_high and rp_bull_high >= rp_side_low
+    current_regime := BULL_HIGH
+else if rp_bear_high >= rp_side_low
+    current_regime := BEAR_HIGH
+else
+    current_regime := SIDE_LOW
+
+string regime_name = "Sideways"
+if current_regime == BULL_LOW
+    regime_name := "Bull Low Vol"
+else if current_regime == BULL_HIGH
+    regime_name := "Bull High Vol"
+else if current_regime == BEAR_HIGH
+    regime_name := "Bear High Vol"
+
+// =============================================================================
+// SECTION 6 — LAYER 3: MARKOV TRANSITION ENGINE
+// =============================================================================
+
+var array<int>   regime_history = array.new_int(i_window, SIDE_LOW)
+var array<float> trans_matrix   = array.new_float(16, 0.25)
+
+// Push current regime into FIFO history buffer
+array.unshift(regime_history, current_regime)
+if array.size(regime_history) > i_window
+    array.pop(regime_history)
+
+// Reset with Laplace prior
+for _i = 0 to 15
+    array.set(trans_matrix, _i, 1.0)
+
+// Accumulate weighted transition counts
+int hist_len = array.size(regime_history)
+int loop_end = math.min(math.min(i_window - 1, hist_len - 2), 299)
+
+for k = 0 to loop_end
+    int   from_r = array.get(regime_history, k + 1)
+    int   to_r   = array.get(regime_history, k)
+    float wk     = math.exp(-lambda_main * float(k))
+    int   t_idx  = from_r * 4 + to_r
+    array.set(trans_matrix, t_idx, array.get(trans_matrix, t_idx) + wk)
+
+// Normalize rows
+for i = 0 to 3
+    float row_sum = 0.0
+    for j = 0 to 3
+        row_sum += array.get(trans_matrix, i * 4 + j)
+    float rs = row_sum == 0.0 ? 1.0 : row_sum
+    for j = 0 to 3
+        int t_idx2 = i * 4 + j
+        array.set(trans_matrix, t_idx2, array.get(trans_matrix, t_idx2) / rs)
+
+// ── Next-regime distribution ──────────────────────────────────────────────────
+float np_bull_low =
+     rp_bull_low  * array.get(trans_matrix, BULL_LOW  * 4 + BULL_LOW)  +
+     rp_bull_high * array.get(trans_matrix, BULL_HIGH * 4 + BULL_LOW)  +
+     rp_bear_high * array.get(trans_matrix, BEAR_HIGH * 4 + BULL_LOW)  +
+     rp_side_low  * array.get(trans_matrix, SIDE_LOW  * 4 + BULL_LOW)
+
+float np_bull_high =
+     rp_bull_low  * array.get(trans_matrix, BULL_LOW  * 4 + BULL_HIGH) +
+     rp_bull_high * array.get(trans_matrix, BULL_HIGH * 4 + BULL_HIGH) +
+     rp_bear_high * array.get(trans_matrix, BEAR_HIGH * 4 + BULL_HIGH) +
+     rp_side_low  * array.get(trans_matrix, SIDE_LOW  * 4 + BULL_HIGH)
+
+float np_bear_high =
+     rp_bull_low  * array.get(trans_matrix, BULL_LOW  * 4 + BEAR_HIGH) +
+     rp_bull_high * array.get(trans_matrix, BULL_HIGH * 4 + BEAR_HIGH) +
+     rp_bear_high * array.get(trans_matrix, BEAR_HIGH * 4 + BEAR_HIGH) +
+     rp_side_low  * array.get(trans_matrix, SIDE_LOW  * 4 + BEAR_HIGH)
+
+float np_side_low =
+     rp_bull_low  * array.get(trans_matrix, BULL_LOW  * 4 + SIDE_LOW)  +
+     rp_bull_high * array.get(trans_matrix, BULL_HIGH * 4 + SIDE_LOW)  +
+     rp_bear_high * array.get(trans_matrix, BEAR_HIGH * 4 + SIDE_LOW)  +
+     rp_side_low  * array.get(trans_matrix, SIDE_LOW  * 4 + SIDE_LOW)
+
+// =============================================================================
+// SECTION 7 — LAYER 4: EMISSION MATRIX & BASE FORECAST
+// =============================================================================
+
+var array<int>   outcome_history = array.new_int(i_window, OUT_NEUTRAL)
+var array<float> emit_matrix     = array.new_float(12, 1.0 / 3.0)
+
+array.unshift(outcome_history, cur_outcome)
+if array.size(outcome_history) > i_window
+    array.pop(outcome_history)
+
+// Reset with Laplace prior
+for _e = 0 to 11
+    array.set(emit_matrix, _e, 1.0)
+
+int out_len  = math.min(array.size(outcome_history), array.size(regime_history))
+int out_loop = math.min(out_len - 2, loop_end)
+
+for k = 0 to out_loop
+    int   h_regime  = array.get(regime_history,  k + 1)
+    int   h_outcome = array.get(outcome_history, k)
+    float wk2       = math.exp(-lambda_main * float(k))
+    int   e_idx     = h_regime * 3 + h_outcome
+    array.set(emit_matrix, e_idx, array.get(emit_matrix, e_idx) + wk2)
+
+// Normalize emission rows
+for i = 0 to 3
+    float row_sum = 0.0
+    for j = 0 to 2
+        row_sum += array.get(emit_matrix, i * 3 + j)
+    float rs2 = row_sum == 0.0 ? 1.0 : row_sum
+    for j = 0 to 2
+        int e_idx2 = i * 3 + j
+        array.set(emit_matrix, e_idx2, array.get(emit_matrix, e_idx2) / rs2)
+
+// ── Base forecast ─────────────────────────────────────────────────────────────
+float base_bull_raw =
+     np_bull_low  * array.get(emit_matrix, BULL_LOW  * 3 + OUT_BULL) +
+     np_bull_high * array.get(emit_matrix, BULL_HIGH * 3 + OUT_BULL) +
+     np_bear_high * array.get(emit_matrix, BEAR_HIGH * 3 + OUT_BULL) +
+     np_side_low  * array.get(emit_matrix, SIDE_LOW  * 3 + OUT_BULL)
+
+float base_bear_raw =
+     np_bull_low  * array.get(emit_matrix, BULL_LOW  * 3 + OUT_BEAR) +
+     np_bull_high * array.get(emit_matrix, BULL_HIGH * 3 + OUT_BEAR) +
+     np_bear_high * array.get(emit_matrix, BEAR_HIGH * 3 + OUT_BEAR) +
+     np_side_low  * array.get(emit_matrix, SIDE_LOW  * 3 + OUT_BEAR)
+
+float base_neutral_raw =
+     np_bull_low  * array.get(emit_matrix, BULL_LOW  * 3 + OUT_NEUTRAL) +
+     np_bull_high * array.get(emit_matrix, BULL_HIGH * 3 + OUT_NEUTRAL) +
+     np_bear_high * array.get(emit_matrix, BEAR_HIGH * 3 + OUT_NEUTRAL) +
+     np_side_low  * array.get(emit_matrix, SIDE_LOW  * 3 + OUT_NEUTRAL)
+
+[base_bull, base_bear, base_neutral] = f_norm3(base_bull_raw, base_bear_raw, base_neutral_raw)
+
+// =============================================================================
+// SECTION 8 — LAYER 5: ADAPTIVE CALIBRATION ENGINE
+// =============================================================================
+// Evaluates PREVIOUS bar's prediction against CURRENT bar's realized outcome.
+// Fully causal — both values known at current bar close.
+
+var array<float> pred_bull_hist   = array.new_float(i_cal_window, UNIFORM_3)
+var array<float> pred_bear_hist   = array.new_float(i_cal_window, UNIFORM_3)
+var array<int>   cal_outcome_hist = array.new_int(i_cal_window,   OUT_NEUTRAL)
+
+// Previous bar's forecast (series shift — causal)
+float prev_base_bull = base_bull[1]
+float prev_base_bear = base_bear[1]
+
+array.unshift(pred_bull_hist,   prev_base_bull)
+array.unshift(pred_bear_hist,   prev_base_bear)
+array.unshift(cal_outcome_hist, cur_outcome)
+
+if array.size(pred_bull_hist)   > i_cal_window
+    array.pop(pred_bull_hist)
+if array.size(pred_bear_hist)   > i_cal_window
+    array.pop(pred_bear_hist)
+if array.size(cal_outcome_hist) > i_cal_window
+    array.pop(cal_outcome_hist)
+
+// ── Rolling calibration accuracy ──────────────────────────────────────────────
+float pred_threshold = 0.40
+
+// Accumulators with Laplace prior
+float cal_bull_correct = 1.0
+float cal_bull_total   = 3.0
+float cal_bear_correct = 1.0
+float cal_bear_total   = 3.0
+float cal_neut_correct = 1.0
+float cal_neut_total   = 3.0
+
+int cal_len      = array.size(cal_outcome_hist)
+int cal_loop_end = math.min(cal_len - 1, i_cal_window - 1)
+
+for k = 0 to cal_loop_end
+    float wk3       = math.exp(-lambda_cal * float(k))
+    int   actual_k  = array.get(cal_outcome_hist, k)
+    float pb_k      = array.get(pred_bull_hist,   k)
+    float pbr_k     = array.get(pred_bear_hist,   k)
+    float pn_k      = math.max(0.0, 1.0 - pb_k - pbr_k)
+
+    if pb_k >= pred_threshold
+        cal_bull_total   += wk3
+        if actual_k == OUT_BULL
+            cal_bull_correct += wk3
+
+    if pbr_k >= pred_threshold
+        cal_bear_total   += wk3
+        if actual_k == OUT_BEAR
+            cal_bear_correct += wk3
+
+    if pn_k >= pred_threshold
+        cal_neut_total   += wk3
+        if actual_k == OUT_NEUTRAL
+            cal_neut_correct += wk3
+
+float cal_acc_bull = cal_bull_correct / cal_bull_total
+float cal_acc_bear = cal_bear_correct / cal_bear_total
+float cal_acc_neut = cal_neut_correct / cal_neut_total
+
+// ── Regime reliability scores ─────────────────────────────────────────────────
+var array<float> regime_rel = array.new_float(4, 0.5)
+
+for r = 0 to 3
+    float rel_correct = 1.0
+    float rel_total   = 2.0
+
+    int implied_out = OUT_NEUTRAL
+    if r == BULL_LOW or r == BULL_HIGH
+        implied_out := OUT_BULL
+    else if r == BEAR_HIGH
+        implied_out := OUT_BEAR
+
+    int rel_loop_end = math.min(
+         math.min(array.size(regime_history) - 2, i_cal_window - 1),
+         199)
+
+    for k = 0 to rel_loop_end
+        int   past_regime  = array.get(regime_history,  k + 1)
+        int   past_outcome = array.get(outcome_history, k)
+        float wk4          = math.exp(-lambda_cal * float(k))
+        if past_regime == r
+            rel_total += wk4
+            if past_outcome == implied_out
+                rel_correct += wk4
+
+    array.set(regime_rel, r,
+         rel_total > 0.0 ? rel_correct / rel_total : 0.5)
+
+// ── Calibration multipliers ───────────────────────────────────────────────────
+float cal_mult_bull = f_clamp(
+     1.0 + i_cal_strength * (cal_acc_bull - UNIFORM_3) / UNIFORM_3,
+     0.50, 2.00)
+
+float cal_mult_bear = f_clamp(
+     1.0 + i_cal_strength * (cal_acc_bear - UNIFORM_3) / UNIFORM_3,
+     0.50, 2.00)
+
+float cal_mult_neut = f_clamp(
+     1.0 + i_cal_strength * (cal_acc_neut - UNIFORM_3) / UNIFORM_3,
+     0.50, 2.00)
+
+// ── Apply calibration ─────────────────────────────────────────────────────────
+float cal_bull_raw    = base_bull    * cal_mult_bull
+float cal_bear_raw    = base_bear    * cal_mult_bear
+float cal_neutral_raw = base_neutral * cal_mult_neut
+
+[cal_bull, cal_bear, cal_neutral] = f_norm3(cal_bull_raw, cal_bear_raw, cal_neutral_raw)
+
+// =============================================================================
+// SECTION 9 — LAYER 6: PROBABILITY STABILIZATION
+// =============================================================================
+
+// ── A: Entropy Regularization — blend toward uniform ─────────────────────────
+float ent_bull_raw    = cal_bull    * (1.0 - i_entropy_reg) + UNIFORM_3 * i_entropy_reg
+float ent_bear_raw    = cal_bear    * (1.0 - i_entropy_reg) + UNIFORM_3 * i_entropy_reg
+float ent_neutral_raw = cal_neutral * (1.0 - i_entropy_reg) + UNIFORM_3 * i_entropy_reg
+
+[ent_bull, ent_bear, ent_neutral] = f_norm3(ent_bull_raw, ent_bear_raw, ent_neutral_raw)
+
+// ── B: Mean Reversion — dampen deviation from uniform ────────────────────────
+float mr_bull_raw    = UNIFORM_3 + (ent_bull    - UNIFORM_3) * (1.0 - i_mean_rev)
+float mr_bear_raw    = UNIFORM_3 + (ent_bear    - UNIFORM_3) * (1.0 - i_mean_rev)
+float mr_neutral_raw = UNIFORM_3 + (ent_neutral - UNIFORM_3) * (1.0 - i_mean_rev)
+
+[mr_bull, mr_bear, mr_neutral] = f_norm3(mr_bull_raw, mr_bear_raw, mr_neutral_raw)
+
+// ── C: Hard Bounds — floor and ceiling ───────────────────────────────────────
+float bnd_bull_raw    = f_clamp(mr_bull,    i_prob_min, i_prob_max)
+float bnd_bear_raw    = f_clamp(mr_bear,    i_prob_min, i_prob_max)
+float bnd_neutral_raw = f_clamp(mr_neutral, i_prob_min, i_prob_max)
+
+[bnd_bull, bnd_bear, bnd_neutral] = f_norm3(bnd_bull_raw, bnd_bear_raw, bnd_neutral_raw)
+
+// =============================================================================
+// SECTION 10 — FINAL SMOOTHING & OUTPUT
+// =============================================================================
+
+float smooth_bull_raw    = ta.ema(bnd_bull,    i_smooth)
+float smooth_bear_raw    = ta.ema(bnd_bear,    i_smooth)
+float smooth_neutral_raw = ta.ema(bnd_neutral, i_smooth)
+
+[p_bull, p_bear, p_neutral] = f_norm3(smooth_bull_raw, smooth_bear_raw, smooth_neutral_raw)
+
+// =============================================================================
+// SECTION 11 — VISUALIZATION: PLOTS
+// =============================================================================
+
+plot(
+     i_show_plot ? dir_score : na,
+     title     = "Directional Score",
+     color     = dir_score >= 0.0
+          ? color.new(color.teal, 0)
+          : color.new(color.red,  0),
+     linewidth = 2,
+     style     = plot.style_histogram)
+
+hline(0,    "Zero",      color = color.gray,                 linestyle = hline.style_solid)
+hline(0.5,  "Bull Zone", color = color.new(color.teal, 60),  linestyle = hline.style_dashed)
+hline(-0.5, "Bear Zone", color = color.new(color.red,  60),  linestyle = hline.style_dashed)
+
+plot(p_bull,    "P(Bullish)", color = color.new(color.lime,   10), linewidth = 2)
+plot(p_bear,    "P(Bearish)", color = color.new(color.red,    10), linewidth = 2)
+plot(p_neutral, "P(Neutral)", color = color.new(color.orange, 30), linewidth = 1)
+
+hline(0.333, "Baseline", color = color.new(color.gray, 50), linestyle = hline.style_dotted)
+
+// =============================================================================
+// SECTION 12 — VISUALIZATION: TABLE
+// =============================================================================
+
+var table tbl = na
+
+if i_show_table and barstate.islast
+
+    tbl := table.new(
+         position    = position.top_right,
+         columns     = 2,
+         rows        = 10,
+         bgcolor      = color.new(color.black, 15),
+         border_color = color.new(color.gray,  50),
+         border_width = 1,
+         frame_color  = color.new(color.gray,  30),
+         frame_width  = 1)
+
+    // Gradient colors for probabilities
+    color c_bull = color.from_gradient(
+         p_bull, 0.33, 0.65,
+         color.new(color.gray, 60), color.new(color.lime, 0))
+
+    color c_bear = color.from_gradient(
+         p_bear, 0.33, 0.65,
+         color.new(color.gray, 60), color.new(color.red, 0))
+
+    color c_neut = color.from_gradient(
+         p_neutral, 0.10, 0.40,
+         color.new(color.gray, 60), color.new(color.orange, 20))
+
+    color c_regime = color.new(color.blue, 20)
+    if current_regime == BULL_LOW
+        c_regime := color.new(color.lime,   20)
+    else if current_regime == BULL_HIGH
+        c_regime := color.new(color.yellow, 10)
+    else if current_regime == BEAR_HIGH
+        c_regime := color.new(color.red,    10)
+
+    // Row 0 — Header
+    table.cell(tbl, 0, 0,
+         text             = "PRD v2  Adaptive Forecast",
+         text_color       = color.white,
+         text_size        = size.normal,
+         text_halign      = text.align_center,
+         bgcolor           = color.new(color.navy, 10),
+         text_font_family = font.family_monospace)
+    table.merge_cells(tbl, 0, 0, 1, 0)
+
+    // Row 1 — Separator
+    table.cell(tbl, 0, 1,
+         text       = "────────────────────",
+         text_color = color.new(color.gray, 40),
+         text_size  = size.tiny,
+         bgcolor    = color.new(color.black, 20))
+    table.merge_cells(tbl, 0, 1, 1, 1)
+
+    // Row 2 — Regime
+    table.cell(tbl, 0, 2,
+         text        = "Regime",
+         text_color  = color.new(color.silver, 20),
+         text_size   = size.small,
+         bgcolor     = color.new(color.black, 20),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 2,
+         text             = regime_name,
+         text_color       = c_regime,
+         text_size        = size.small,
+         bgcolor          = color.new(color.black, 20),
+         text_font_family = font.family_monospace)
+
+    // Row 3 — Bullish
+    table.cell(tbl, 0, 3,
+         text        = "▲ Bullish",
+         text_color  = color.new(color.lime, 20),
+         text_size   = size.normal,
+         bgcolor     = color.new(color.black, 20),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 3,
+         text             = str.format("{0,number,#.#}%", p_bull * 100),
+         text_color       = c_bull,
+         text_size        = size.normal,
+         bgcolor          = color.new(color.black, 20),
+         text_font_family = font.family_monospace)
+
+    // Row 4 — Bearish
+    table.cell(tbl, 0, 4,
+         text        = "▼ Bearish",
+         text_color  = color.new(color.red, 20),
+         text_size   = size.normal,
+         bgcolor     = color.new(color.black, 20),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 4,
+         text             = str.format("{0,number,#.#}%", p_bear * 100),
+         text_color       = c_bear,
+         text_size        = size.normal,
+         bgcolor          = color.new(color.black, 20),
+         text_font_family = font.family_monospace)
+
+    // Row 5 — Neutral
+    table.cell(tbl, 0, 5,
+         text        = "◆ Neutral",
+         text_color  = color.new(color.orange, 20),
+         text_size   = size.normal,
+         bgcolor     = color.new(color.black, 20),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 5,
+         text             = str.format("{0,number,#.#}%", p_neutral * 100),
+         text_color       = c_neut,
+         text_size        = size.normal,
+         bgcolor          = color.new(color.black, 20),
+         text_font_family = font.family_monospace)
+
+    // Row 6 — Bias
+    string bias_label = "NO CLEAR EDGE"
+    color  bias_color = color.new(color.gray, 20)
+    if p_bull > p_bear and p_bull > p_neutral
+        bias_label := "BULLISH EDGE"
+        bias_color := color.new(color.lime, 0)
+    else if p_bear > p_bull and p_bear > p_neutral
+        bias_label := "BEARISH EDGE"
+        bias_color := color.new(color.red, 0)
+
+    table.cell(tbl, 0, 6,
+         text        = "Bias",
+         text_color  = color.new(color.silver, 20),
+         text_size   = size.small,
+         bgcolor     = color.new(color.black, 20),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 6,
+         text             = bias_label,
+         text_color       = bias_color,
+         text_size        = size.small,
+         bgcolor          = color.new(color.black, 20),
+         text_font_family = font.family_monospace)
+
+    // Row 7 — Calibration Accuracy
+    string cal_label = str.format("▲{0}% ▼{1}%",
+         math.round(cal_acc_bull * 100),
+         math.round(cal_acc_bear * 100))
+    color cal_color = math.max(cal_acc_bull, cal_acc_bear) > 0.40
+         ? color.new(color.lime,   20)
+         : color.new(color.orange, 20)
+
+    table.cell(tbl, 0, 7,
+         text        = "Cal.Acc",
+         text_color  = color.new(color.silver, 30),
+         text_size   = size.tiny,
+         bgcolor     = color.new(color.black, 25),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 7,
+         text             = cal_label,
+         text_color       = cal_color,
+         text_size        = size.tiny,
+         bgcolor          = color.new(color.black, 25),
+         text_font_family = font.family_monospace)
+
+    // Row 8 — Regime Reliability
+    float  cur_rel    = array.get(regime_rel, current_regime)
+    string rel_label  = str.format("{0}%", math.round(cur_rel * 100))
+    color  rel_color  = cur_rel > 0.50
+         ? color.new(color.lime,   20)
+         : color.new(color.orange, 20)
+
+    table.cell(tbl, 0, 8,
+         text        = "Reg.Rel",
+         text_color  = color.new(color.silver, 30),
+         text_size   = size.tiny,
+         bgcolor     = color.new(color.black, 25),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 8,
+         text             = rel_label,
+         text_color       = rel_color,
+         text_size        = size.tiny,
+         bgcolor          = color.new(color.black, 25),
+         text_font_family = font.family_monospace)
+
+    // Row 9 — Weekly Context
+    string wk_label = "—"
+    color  wk_color = color.new(color.gray, 50)
+    if i_use_weekly
+        if w_momentum > 0.20
+            wk_label := "↑ Bull"
+            wk_color := color.new(color.lime, 20)
+        else if w_momentum < -0.20
+            wk_label := "↓ Bear"
+            wk_color := color.new(color.red, 20)
+        else
+            wk_label := "→ Flat"
+            wk_color := color.new(color.gray, 20)
+
+    table.cell(tbl, 0, 9,
+         text        = i_use_weekly ? "Weekly" : "Wkly Off",
+         text_color  = color.new(color.silver, 40),
+         text_size   = size.tiny,
+         bgcolor     = color.new(color.black, 30),
+         text_halign = text.align_right)
+    table.cell(tbl, 1, 9,
+         text             = wk_label,
+         text_color       = wk_color,
+         text_size        = size.tiny,
+         bgcolor          = color.new(color.black, 30),
+         text_font_family = font.family_monospace)
+
+// =============================================================================
+// END OF SCRIPT — PRD v2.1 Adaptive Regime Direction Forecast
+// =============================================================================
